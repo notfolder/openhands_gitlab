@@ -32,8 +32,10 @@ app = Flask(__name__)
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
 GITLAB_BASE_URL = os.environ.get("GITLAB_BASE_URL", "http://host.docker.internal:8080")
 GIT_BASE_DOMAIN = os.environ.get("GIT_BASE_DOMAIN", "host.docker.internal:8080")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4o")
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4.1")
+# OpenAI 互換 API (LiteLLM proxy 等) を使う場合に設定。空なら OpenAI 直接接続。
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 TRIGGER_LABEL = os.environ.get("TRIGGER_LABEL", "openhands")
 TRIGGER_MENTION = os.environ.get("TRIGGER_MENTION", "@openhands")
@@ -84,8 +86,10 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         "-e", f"GITLAB_BASE_URL={GITLAB_BASE_URL}",
         "-e", f"GIT_BASE_DOMAIN={GIT_BASE_DOMAIN}",
         # LLM
-        "-e", f"LLM_API_KEY={OPENAI_API_KEY}",
+        "-e", f"LLM_API_KEY={LLM_API_KEY}",
         "-e", f"LLM_MODEL={LLM_MODEL}",
+        # LiteLLM proxy 等 OpenAI 互換 API の場合のみ設定（空なら OpenAI 直接）
+        *(["-e", f"LLM_BASE_URL={LLM_BASE_URL}"] if LLM_BASE_URL else []),
         # Agent Server
         "-e", "AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server",
         "-e", f"AGENT_SERVER_IMAGE_TAG={AGENT_SERVER_IMAGE_TAG}",
@@ -232,13 +236,19 @@ def health():
     missing = []
     if not GITLAB_TOKEN:
         missing.append("GITLAB_TOKEN")
-    if not OPENAI_API_KEY:
-        missing.append("OPENAI_API_KEY")
+    if not LLM_API_KEY:
+        missing.append("LLM_API_KEY")
 
     if missing:
         return jsonify({"status": "warning", "missing_env": missing}), 200
 
-    return jsonify({"status": "ok", "trigger_label": TRIGGER_LABEL, "trigger_mention": TRIGGER_MENTION})
+    return jsonify({
+        "status": "ok",
+        "trigger_label": TRIGGER_LABEL,
+        "trigger_mention": TRIGGER_MENTION,
+        "llm_model": LLM_MODEL,
+        "llm_base_url": LLM_BASE_URL or "(OpenAI direct)",
+    })
 
 
 if __name__ == "__main__":

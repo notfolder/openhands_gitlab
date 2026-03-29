@@ -46,8 +46,10 @@ services:
       - AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server
       - AGENT_SERVER_IMAGE_TAG=1.12.0-python
       - WORKSPACE_MOUNT_PATH=/opt/workspace_base
-      - LLM_MODEL=${LLM_MODEL:-openai/gpt-4o}
-      - LLM_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-openai/gpt-4.1}
+      - LLM_API_KEY=${LLM_API_KEY}
+      # OpenAI 互換 API (LiteLLM proxy 等) のエンドポイント。空なら OpenAI 直接接続。
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - openhands-config:/.openhands
@@ -79,9 +81,10 @@ services:
       #   Linux → Docker bridge gateway IP (例: 172.17.0.1)
       - GITLAB_BASE_URL=http://${DOCKER_HOST_INTERNAL:-host.docker.internal}:8080
       - GIT_BASE_DOMAIN=${DOCKER_HOST_INTERNAL:-host.docker.internal}:8080
-      # OpenAI 設定
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - LLM_MODEL=${LLM_MODEL:-openai/gpt-4o}
+      # LLM 設定（OpenAI 直接 / LiteLLM proxy 共通）
+      - LLM_API_KEY=${LLM_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-openai/gpt-4.1}
+      - LLM_BASE_URL=${LLM_BASE_URL:-}
       # Webhook 認証トークン
       - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
       # トリガー設定
