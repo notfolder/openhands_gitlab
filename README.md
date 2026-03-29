@@ -1,0 +1,2 @@
+# openhands_gitlab
+self-hostedのgitlabとself-hostedのgitlabの連携を確認する
