@@ -1,0 +1,119 @@
+name: openhands-gitlab
+
+services:
+  # ─── GitLab CE ───────────────────────────────────────────────────────────────
+  gitlab:
+    image: gitlab/gitlab-ce:latest
+    container_name: gitlab
+    restart: unless-stopped
+    hostname: gitlab
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'http://localhost:8080'
+        gitlab_rails['initial_root_password'] = ENV['GITLAB_ROOT_PASSWORD']
+        gitlab_rails['gitlab_shell_ssh_port'] = 2222
+        # ローカル検証用の軽量化設定
+        prometheus_monitoring['enable'] = false
+        alertmanager['enable'] = false
+        grafana['enable'] = false
+        gitlab_exporter['enable'] = false
+        node_exporter['enable'] = false
+    ports:
+      - "8080:80"
+      - "2222:22"
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+    networks:
+      - openhands-net
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost/-/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 30
+      start_period: 300s
+
+  # ─── OpenHands UI ─────────────────────────────────────────────────────────────
+  openhands:
+    image: docker.openhands.dev/openhands/openhands:1.5
+    container_name: openhands
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server
+      - AGENT_SERVER_IMAGE_TAG=1.12.0-python
+      - WORKSPACE_MOUNT_PATH=/opt/workspace_base
+      - LLM_MODEL=${LLM_MODEL:-openai/gpt-4o}
+      - LLM_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - openhands-config:/.openhands
+      - openhands-workspace:/opt/workspace_base
+    # Linux でも host.docker.internal を解決可能にする
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - openhands-net
+    stdin_open: true
+    tty: true
+    depends_on:
+      gitlab:
+        condition: service_healthy
+
+  # ─── Webhook Receiver (GitLab → OpenHands Resolver トリガー) ──────────────────
+  openhands-webhook:
+    build:
+      context: ./webhook
+    container_name: openhands-webhook
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      # GitLab 接続設定
+      - GITLAB_TOKEN=${GITLAB_TOKEN}
+      # DOCKER_HOST_INTERNAL は setup.sh が OS を判定して .env に書き込む
+      #   Mac  → host.docker.internal
+      #   Linux → Docker bridge gateway IP (例: 172.17.0.1)
+      - GITLAB_BASE_URL=http://${DOCKER_HOST_INTERNAL:-host.docker.internal}:8080
+      - GIT_BASE_DOMAIN=${DOCKER_HOST_INTERNAL:-host.docker.internal}:8080
+      # OpenAI 設定
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-openai/gpt-4o}
+      # Webhook 認証トークン
+      - WEBHOOK_SECRET=${WEBHOOK_SECRET:-}
+      # トリガー設定
+      - TRIGGER_LABEL=${TRIGGER_LABEL:-openhands}
+      - TRIGGER_MENTION=${TRIGGER_MENTION:-@openhands}
+      # Resolver が使う Docker ネットワーク・イメージ
+      - RESOLVER_NETWORK=openhands-net
+      - OPENHANDS_IMAGE=docker.openhands.dev/openhands/openhands:1.5
+      - AGENT_SERVER_IMAGE_TAG=1.12.0-python
+      # DooD 用 Workspace ホストパス（このコンテナ内とホストで同一パスにマウントする）
+      - RESOLVER_WORKSPACE_HOST_PATH=/tmp/openhands-resolver-workspace
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # DooD: Webhook コンテナが作成したパスをそのままホストパスとして使えるよう
+      #       ホストと同一パスでマウントする
+      - /tmp/openhands-resolver-workspace:/tmp/openhands-resolver-workspace
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - openhands-net
+    depends_on:
+      gitlab:
+        condition: service_healthy
+
+networks:
+  openhands-net:
+    name: openhands-net
+    driver: bridge
+
+volumes:
+  gitlab-config:
+  gitlab-logs:
+  gitlab-data:
+  openhands-config:
+  openhands-workspace:
