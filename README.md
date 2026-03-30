@@ -241,6 +241,24 @@ Issue または MR のコメント欄に：
 
 グループ `openhands` 配下にプロジェクトを作成するだけで Webhook・ラベルが自動的に適用されます。追加設定は不要です。
 
+### 別グループへの Webhook 追加
+
+`openhands` グループ以外の既存グループにも Webhook を追加できます。
+対象グループで `openhands` ユーザーが Owner 権限を持っている必要があります。
+
+```bash
+./scripts/setup.sh --add-group <group-path>
+
+# 例: my-team グループに追加
+./scripts/setup.sh --add-group my-team
+```
+
+実行されること：
+
+- 指定グループの存在確認
+- グループレベルラベル `openhands` を追加（既存の場合はスキップ）
+- グループ Webhook を登録（既存の openhands Webhook は置き換え）
+
 ---
 
 ## プロジェクト独自プロンプトの注入

@@ -296,8 +296,110 @@ create_test_project() {
     fi
 }
 
+# ─── 既存グループへの Webhook 追加 ───────────────────────────────────────────
+# 指定したグループ（path）に openhands Webhook とラベルを追加する。
+# グループは既に存在している必要がある。openhands ユーザーが Owner 権限を持つこと。
+add_webhook_to_group() {
+    local target_group="$1"
+
+    info "グループ '${target_group}' を検索しています..."
+
+    local existing
+    existing=$(curl -sf \
+        --header "Authorization: Bearer ${GITLAB_TOKEN}" \
+        "${GITLAB_URL}/api/v4/groups?search=${target_group}" 2>/dev/null || echo "[]")
+
+    local group_id
+    group_id=$(echo "$existing" | python3 -c "
+import sys, json
+for g in json.load(sys.stdin):
+    if g.get('path') == '${target_group}':
+        print(g['id']); break
+" 2>/dev/null || echo "")
+
+    if [ -z "$group_id" ]; then
+        die "グループ '${target_group}' が見つかりません。パスが正しいか確認してください"
+    fi
+
+    info "グループ確認済み (ID: ${group_id})"
+
+    # ラベル追加（既存の場合はスキップ）
+    info "グループレベルラベル '${TRIGGER_LABEL}' を作成しています..."
+    curl -sf \
+        --request POST \
+        --header "Authorization: Bearer ${GITLAB_TOKEN}" \
+        --header "Content-Type: application/json" \
+        --data "{
+            \"name\": \"${TRIGGER_LABEL}\",
+            \"color\": \"#0075ca\",
+            \"description\": \"OpenHands に処理を依頼するラベル（グループ共通）\"
+        }" \
+        "${GITLAB_URL}/api/v4/groups/${group_id}/labels" > /dev/null 2>&1 || true
+    info "ラベル '${TRIGGER_LABEL}' を設定しました（既存の場合はスキップ）"
+
+    # Webhook 登録
+    register_group_webhook "$group_id"
+
+    echo ""
+    echo "=============================================="
+    info "グループへの Webhook 追加完了！"
+    echo ""
+    echo "  グループ: ${GITLAB_URL}/${target_group}"
+    echo "  Webhook:  ${WEBHOOK_URL}"
+    echo "  ラベル:   ${TRIGGER_LABEL}"
+    echo "=============================================="
+}
+
+# ─── ヘルプ ──────────────────────────────────────────────────────────────────
+usage() {
+    echo "使い方:"
+    echo "  ./scripts/setup.sh                      # 初回セットアップ（グループ作成 + Webhook 登録）"
+    echo "  ./scripts/setup.sh --add-group <path>   # 既存グループに Webhook を追加"
+    echo ""
+    echo "オプション:"
+    echo "  --add-group <path>   Webhook を追加するグループのパス（例: my-team）"
+    echo "  -h, --help           このヘルプを表示"
+}
+
 # ─── メイン処理 ───────────────────────────────────────────────────────────────
 main() {
+    # 引数解析
+    local mode="setup"
+    local add_group_path=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --add-group)
+                mode="add-group"
+                add_group_path="${2:?--add-group にはグループパスが必要です}"
+                shift 2
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "不明なオプション: $1"
+                ;;
+        esac
+    done
+
+    # ─── グループ追加モード ────────────────────────────────────────────────────
+    if [[ "$mode" == "add-group" ]]; then
+        echo ""
+        echo "=============================================="
+        echo " OpenHands Webhook 追加"
+        echo " GitLab: ${GITLAB_URL}"
+        echo " 対象グループ: ${add_group_path}"
+        echo "=============================================="
+        echo ""
+
+        verify_token > /dev/null
+        add_webhook_to_group "$add_group_path"
+        return
+    fi
+
+    # ─── 初回セットアップモード ───────────────────────────────────────────────
     echo ""
     echo "=============================================="
     echo " OpenHands + GitLab セットアップ"
@@ -354,6 +456,9 @@ main() {
     echo "  実行ユーザー:     ${openhands_user}"
     echo "  グループ Webhook: グループ配下の全プロジェクトで有効"
     echo "  共通ラベル:       ${TRIGGER_LABEL}"
+    echo ""
+    echo "別のグループにも Webhook を追加するには:"
+    echo "  ./scripts/setup.sh --add-group <group-path>"
     echo "=============================================="
 }
 
