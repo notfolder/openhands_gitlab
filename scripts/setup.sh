@@ -123,8 +123,6 @@ verify_token() {
 }
 
 # ─── グループ作成 ─────────────────────────────────────────────────────────────
-# openhands ユーザー自身のトークンで作成するため、
-# 作成者が自動的に Owner になりグループ Webhook の登録も可能。
 create_group() {
     info "グループ '${GITLAB_GROUP}' を確認しています..."
 
@@ -166,24 +164,6 @@ for g in json.load(sys.stdin):
         fi
         info "グループ作成完了 (ID: ${group_id})"
     else
-        # 既存グループへの Owner 権限確認
-        local my_access
-        my_access=$(curl -sf \
-            --header "Authorization: Bearer ${GITLAB_TOKEN}" \
-            "${GITLAB_URL}/api/v4/groups/${group_id}/members/all" 2>/dev/null \
-            | python3 -c "
-import sys, json
-for m in json.load(sys.stdin):
-    if m.get('username') == '${OPENHANDS_USER:-}':
-        print(m.get('access_level', 0)); break
-else:
-    print(50)  # 自分が Owner として作成した場合はデフォルト50
-" 2>/dev/null || echo "50")
-
-        if [[ "$my_access" -lt 50 ]]; then
-            warn "グループ '${GITLAB_GROUP}' への Owner 権限が確認できません（access_level: ${my_access}）"
-            warn "Webhook 登録に失敗する場合は管理者に Owner 権限の付与を依頼してください"
-        fi
         info "グループ確認済み (ID: ${group_id})"
     fi
 
@@ -191,6 +171,8 @@ else:
 }
 
 # ─── グループレベルラベル作成 ─────────────────────────────────────────────────
+# GitLab CE でもグループレベルラベルは使用可能。
+# グループ配下の全プロジェクトでこのラベルが共通利用できる。
 create_group_label() {
     local group_id="$1"
 
@@ -207,20 +189,26 @@ create_group_label() {
         }" \
         "${GITLAB_URL}/api/v4/groups/${group_id}/labels" > /dev/null 2>&1 || true
 
-    info "グループレベルラベル '${TRIGGER_LABEL}' を作成しました"
+    info "グループレベルラベル '${TRIGGER_LABEL}' を作成しました（既存の場合はスキップ）"
 }
 
-# ─── グループ Webhook 登録 ────────────────────────────────────────────────────
-register_group_webhook() {
-    local group_id="$1"
+# ─── プロジェクト Webhook 登録 ────────────────────────────────────────────────
+# GitLab CE ではグループ Webhook が使えないため、プロジェクト単位で登録する。
+# project_path: "namespace/project-name" 形式（例: openhands/openhands-test）
+register_project_webhook() {
+    local project_path="$1"
 
-    info "グループ Webhook を登録しています: ${WEBHOOK_URL}"
+    # API 用に URL エンコード（/ → %2F）
+    local encoded_path
+    encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${project_path}', safe=''))")
 
-    # 既存の openhands webhook を削除
+    info "プロジェクト Webhook を登録しています: ${project_path} → ${WEBHOOK_URL}"
+
+    # 既存の openhands Webhook を削除
     local existing_hooks
     existing_hooks=$(curl -sf \
         --header "Authorization: Bearer ${GITLAB_TOKEN}" \
-        "${GITLAB_URL}/api/v4/groups/${group_id}/hooks" 2>/dev/null || echo "[]")
+        "${GITLAB_URL}/api/v4/projects/${encoded_path}/hooks" 2>/dev/null || echo "[]")
 
     echo "$existing_hooks" | python3 -c "
 import sys, json
@@ -230,8 +218,8 @@ for h in json.load(sys.stdin):
 " 2>/dev/null | while read -r hook_id; do
         curl -sf --request DELETE \
             --header "Authorization: Bearer ${GITLAB_TOKEN}" \
-            "${GITLAB_URL}/api/v4/groups/${group_id}/hooks/${hook_id}" > /dev/null 2>&1 || true
-        info "既存のグループ Webhook (ID: ${hook_id}) を削除しました"
+            "${GITLAB_URL}/api/v4/projects/${encoded_path}/hooks/${hook_id}" > /dev/null 2>&1 || true
+        info "既存の Webhook (ID: ${hook_id}) を削除しました"
     done
 
     local hook_response
@@ -246,29 +234,28 @@ for h in json.load(sys.stdin):
             \"note_events\": true,
             \"merge_requests_events\": true,
             \"push_events\": false,
-            \"member_events\": false,
             \"enable_ssl_verification\": false
         }" \
-        "${GITLAB_URL}/api/v4/groups/${group_id}/hooks" 2>&1 || echo "")
+        "${GITLAB_URL}/api/v4/projects/${encoded_path}/hooks" 2>/dev/null || echo "")
 
     local hook_id
     hook_id=$(echo "$hook_response" | python3 -c \
         "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
 
     if [ -n "$hook_id" ]; then
-        info "グループ Webhook 登録完了 (ID: ${hook_id})"
+        info "プロジェクト Webhook 登録完了 (ID: ${hook_id})"
     else
-        warn "グループ Webhook の登録に失敗しました"
-        warn "グループの Owner 権限があるか確認してください"
-        warn "再実行: ./scripts/setup.sh"
+        warn "プロジェクト Webhook の登録に失敗しました: ${project_path}"
+        warn "openhands ユーザーがプロジェクトの Maintainer 以上の権限を持っているか確認してください"
     fi
 }
 
-# ─── テストプロジェクト作成 ───────────────────────────────────────────────────
+# ─── テストプロジェクト作成 + Webhook 登録 ────────────────────────────────────
 create_test_project() {
     local group_id="$1"
+    local project_path="${GITLAB_GROUP}/openhands-test"
 
-    info "テストプロジェクト '${GITLAB_GROUP}/openhands-test' を作成しています..."
+    info "テストプロジェクト '${project_path}' を作成しています..."
 
     local response
     response=$(curl -sf \
@@ -292,86 +279,111 @@ create_test_project() {
     if [ -n "$project_id" ]; then
         info "テストプロジェクト作成完了 (ID: ${project_id})"
     else
-        warn "テストプロジェクトはすでに存在するか作成に失敗しました（スキップ）"
+        warn "テストプロジェクトはすでに存在するか作成に失敗しました（Webhook 登録のみ実行）"
     fi
+
+    # Webhook を登録（作成済みの場合も再登録）
+    register_project_webhook "$project_path"
 }
 
-# ─── 既存グループへの Webhook 追加 ───────────────────────────────────────────
-# 指定したグループ（path）に openhands Webhook とラベルを追加する。
-# グループは既に存在している必要がある。openhands ユーザーが Owner 権限を持つこと。
-add_webhook_to_group() {
-    local target_group="$1"
+# ─── 既存プロジェクトへの Webhook 追加 ───────────────────────────────────────
+# 指定したプロジェクト（namespace/project）に Webhook とラベルを追加する。
+# openhands ユーザーがそのプロジェクトの Maintainer 以上の権限を持つこと。
+add_webhook_to_project() {
+    local target_project="$1"
 
-    info "グループ '${target_group}' を検索しています..."
+    # プロジェクトの存在確認
+    local encoded_path
+    encoded_path=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${target_project}', safe=''))")
 
-    local existing
-    existing=$(curl -sf \
+    info "プロジェクト '${target_project}' を確認しています..."
+
+    local project_info
+    project_info=$(curl -sf \
         --header "Authorization: Bearer ${GITLAB_TOKEN}" \
-        "${GITLAB_URL}/api/v4/groups?search=${target_group}" 2>/dev/null || echo "[]")
+        "${GITLAB_URL}/api/v4/projects/${encoded_path}" 2>/dev/null || echo "")
 
-    local group_id
-    group_id=$(echo "$existing" | python3 -c "
+    local project_id
+    project_id=$(echo "$project_info" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null || echo "")
+
+    if [ -z "$project_id" ]; then
+        die "プロジェクト '${target_project}' が見つかりません。パスが正しいか確認してください"
+    fi
+
+    local namespace
+    namespace=$(echo "$project_info" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('namespace',{}).get('path',''))" 2>/dev/null || echo "")
+
+    info "プロジェクト確認済み (ID: ${project_id})"
+
+    # グループレベルラベルを追加（グループ配下の場合のみ）
+    if [ -n "$namespace" ]; then
+        local group_id
+        group_id=$(curl -sf \
+            --header "Authorization: Bearer ${GITLAB_TOKEN}" \
+            "${GITLAB_URL}/api/v4/groups?search=${namespace}" 2>/dev/null \
+            | python3 -c "
 import sys, json
 for g in json.load(sys.stdin):
-    if g.get('path') == '${target_group}':
+    if g.get('path') == '${namespace}':
         print(g['id']); break
 " 2>/dev/null || echo "")
 
-    if [ -z "$group_id" ]; then
-        die "グループ '${target_group}' が見つかりません。パスが正しいか確認してください"
+        if [ -n "$group_id" ]; then
+            curl -sf \
+                --request POST \
+                --header "Authorization: Bearer ${GITLAB_TOKEN}" \
+                --header "Content-Type: application/json" \
+                --data "{
+                    \"name\": \"${TRIGGER_LABEL}\",
+                    \"color\": \"#0075ca\",
+                    \"description\": \"OpenHands に処理を依頼するラベル（グループ共通）\"
+                }" \
+                "${GITLAB_URL}/api/v4/groups/${group_id}/labels" > /dev/null 2>&1 || true
+            info "グループレベルラベル '${TRIGGER_LABEL}' を設定しました（既存の場合はスキップ）"
+        fi
     fi
 
-    info "グループ確認済み (ID: ${group_id})"
-
-    # ラベル追加（既存の場合はスキップ）
-    info "グループレベルラベル '${TRIGGER_LABEL}' を作成しています..."
-    curl -sf \
-        --request POST \
-        --header "Authorization: Bearer ${GITLAB_TOKEN}" \
-        --header "Content-Type: application/json" \
-        --data "{
-            \"name\": \"${TRIGGER_LABEL}\",
-            \"color\": \"#0075ca\",
-            \"description\": \"OpenHands に処理を依頼するラベル（グループ共通）\"
-        }" \
-        "${GITLAB_URL}/api/v4/groups/${group_id}/labels" > /dev/null 2>&1 || true
-    info "ラベル '${TRIGGER_LABEL}' を設定しました（既存の場合はスキップ）"
-
     # Webhook 登録
-    register_group_webhook "$group_id"
+    register_project_webhook "$target_project"
 
     echo ""
     echo "=============================================="
-    info "グループへの Webhook 追加完了！"
+    info "プロジェクトへの Webhook 追加完了！"
     echo ""
-    echo "  グループ: ${GITLAB_URL}/${target_group}"
-    echo "  Webhook:  ${WEBHOOK_URL}"
-    echo "  ラベル:   ${TRIGGER_LABEL}"
+    echo "  プロジェクト: ${GITLAB_URL}/${target_project}"
+    echo "  Webhook:     ${WEBHOOK_URL}"
+    echo "  ラベル:      ${TRIGGER_LABEL}"
+    echo ""
+    echo "確認方法:"
+    echo "  ${GITLAB_URL}/${target_project}/-/hooks"
     echo "=============================================="
 }
 
 # ─── ヘルプ ──────────────────────────────────────────────────────────────────
 usage() {
     echo "使い方:"
-    echo "  ./scripts/setup.sh                      # 初回セットアップ（グループ作成 + Webhook 登録）"
-    echo "  ./scripts/setup.sh --add-group <path>   # 既存グループに Webhook を追加"
+    echo "  ./scripts/setup.sh                                # 初回セットアップ"
+    echo "  ./scripts/setup.sh --add-project <namespace/project>  # 既存プロジェクトに Webhook を追加"
     echo ""
     echo "オプション:"
-    echo "  --add-group <path>   Webhook を追加するグループのパス（例: my-team）"
-    echo "  -h, --help           このヘルプを表示"
+    echo "  --add-project <namespace/project>   Webhook を追加するプロジェクトのパス"
+    echo "                                      例: my-team/my-repo"
+    echo "  -h, --help                          このヘルプを表示"
 }
 
 # ─── メイン処理 ───────────────────────────────────────────────────────────────
 main() {
     # 引数解析
     local mode="setup"
-    local add_group_path=""
+    local add_project_path=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --add-group)
-                mode="add-group"
-                add_group_path="${2:?--add-group にはグループパスが必要です}"
+            --add-project)
+                mode="add-project"
+                add_project_path="${2:?--add-project には namespace/project 形式のパスが必要です}"
                 shift 2
                 ;;
             -h|--help)
@@ -384,18 +396,18 @@ main() {
         esac
     done
 
-    # ─── グループ追加モード ────────────────────────────────────────────────────
-    if [[ "$mode" == "add-group" ]]; then
+    # ─── プロジェクト追加モード ───────────────────────────────────────────────
+    if [[ "$mode" == "add-project" ]]; then
         echo ""
         echo "=============================================="
         echo " OpenHands Webhook 追加"
         echo " GitLab: ${GITLAB_URL}"
-        echo " 対象グループ: ${add_group_path}"
+        echo " 対象プロジェクト: ${add_project_path}"
         echo "=============================================="
         echo ""
 
         verify_token > /dev/null
-        add_webhook_to_group "$add_group_path"
+        add_webhook_to_project "$add_project_path"
         return
     fi
 
@@ -425,13 +437,14 @@ main() {
     docker_host=$(detect_docker_host)
     update_env_key "DOCKER_HOST_INTERNAL" "${docker_host}"
 
-    # グループ作成（openhands ユーザーが Owner として作成）
+    # グループ作成
     local group_id
     group_id=$(create_group) || { warn "グループ作成をスキップしました"; exit 0; }
 
     if [ -n "$group_id" ]; then
+        # グループレベルラベル作成（CE でも動作）
         create_group_label "$group_id"
-        register_group_webhook "$group_id"
+        # テストプロジェクト作成 + プロジェクト Webhook 登録
         create_test_project "$group_id"
     fi
 
@@ -452,13 +465,13 @@ main() {
     echo "  OpenHands: http://localhost:${OPENHANDS_PORT:-3000}"
     echo "  Webhook:   http://localhost:${WEBHOOK_PORT:-5000}/health"
     echo ""
-    echo "グループ: ${GITLAB_URL}/${GITLAB_GROUP}"
-    echo "  実行ユーザー:     ${openhands_user}"
-    echo "  グループ Webhook: グループ配下の全プロジェクトで有効"
-    echo "  共通ラベル:       ${TRIGGER_LABEL}"
+    echo "テストプロジェクト: ${GITLAB_URL}/${GITLAB_GROUP}/openhands-test"
+    echo "  実行ユーザー: ${openhands_user}"
+    echo "  共通ラベル:   ${TRIGGER_LABEL}"
+    echo "  Webhook 確認: ${GITLAB_URL}/${GITLAB_GROUP}/openhands-test/-/hooks"
     echo ""
-    echo "別のグループにも Webhook を追加するには:"
-    echo "  ./scripts/setup.sh --add-group <group-path>"
+    echo "新規プロジェクトに Webhook を追加するには:"
+    echo "  ./scripts/setup.sh --add-project <namespace/project>"
     echo "=============================================="
 }
 

@@ -62,9 +62,9 @@ Issue / MR のコメントに "@openhands" を含める
 
 ### グループ横断対応
 
-- グループ `openhands` 配下の**全プロジェクト**に Webhook が自動適用される
-- グループレベルのラベル `openhands` が全プロジェクトで共通利用できる
-- 新規プロジェクトはグループ配下に作るだけで追加設定不要
+- グループレベルのラベル `openhands` が全プロジェクトで共通利用できる（GitLab CE でも動作）
+- Webhook はプロジェクト単位で登録（GitLab CE ではグループ Webhook が使えないため）
+- 新規プロジェクト追加時は `./scripts/setup.sh --add-project` で Webhook を登録
 
 ---
 
@@ -177,9 +177,9 @@ LLM_BASE_URL=http://<litellm-host>:4000
 - GitLab への接続確認（`GITLAB_TOKEN` の検証）
 - OS 判定 → `DOCKER_HOST_INTERNAL` を `.env` に自動書き込み
 - グループ `openhands` を作成（`openhands` ユーザーが Owner として作成）
-- グループレベルラベル `openhands` を作成
-- グループ Webhook を登録（配下の全プロジェクトに自動適用）
+- グループレベルラベル `openhands` を作成（全プロジェクトで共通利用可能）
 - テストプロジェクト `openhands/openhands-test` を作成
+- テストプロジェクトにプロジェクト Webhook を登録
 - `GITLAB_BASE_URL` / `GIT_BASE_DOMAIN` を `.env` に自動書き込み
 
 > **can_create_group が無効の場合**: GitLab 管理者にグループ作成と `openhands` ユーザーへの Owner 権限付与を依頼してください。その後 `GITLAB_GROUP` を既存グループのパスに設定して再実行します。
@@ -237,27 +237,33 @@ Issue または MR のコメント欄に：
 
 と書いて送信すると Resolver が起動します。
 
-### 新規プロジェクトの追加
+### 新規プロジェクトへの Webhook 追加
 
-グループ `openhands` 配下にプロジェクトを作成するだけで Webhook・ラベルが自動的に適用されます。追加設定は不要です。
-
-### 別グループへの Webhook 追加
-
-`openhands` グループ以外の既存グループにも Webhook を追加できます。
-対象グループで `openhands` ユーザーが Owner 権限を持っている必要があります。
+新規プロジェクトを作成したら以下を実行して Webhook を登録します。
 
 ```bash
-./scripts/setup.sh --add-group <group-path>
+./scripts/setup.sh --add-project <namespace/project>
 
-# 例: my-team グループに追加
-./scripts/setup.sh --add-group my-team
+# 例: openhands グループの my-repo プロジェクトに追加
+./scripts/setup.sh --add-project openhands/my-repo
+
+# 例: 別グループのプロジェクトに追加（openhands ユーザーが Maintainer 以上であること）
+./scripts/setup.sh --add-project other-team/their-repo
 ```
 
 実行されること：
 
-- 指定グループの存在確認
-- グループレベルラベル `openhands` を追加（既存の場合はスキップ）
-- グループ Webhook を登録（既存の openhands Webhook は置き換え）
+- プロジェクトの存在確認
+- グループレベルラベル `openhands` を追加（グループ配下の場合、既存はスキップ）
+- プロジェクト Webhook を登録（既存の openhands Webhook は置き換え）
+
+登録後の確認：
+
+```text
+http://<GitLab URL>/<namespace>/<project>/-/hooks
+```
+
+> **権限について**: `openhands` ユーザーがプロジェクトの **Maintainer 以上**の権限を持っている必要があります。グループ Owner が作成したプロジェクトには自動的に権限が付与されます。
 
 ---
 
