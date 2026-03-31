@@ -491,6 +491,16 @@ main() {
         create_test_project "$group_id"
     fi
 
+    # Resolver イメージビルド
+    # openhands:1.5 は git を含まないため、git を追加したカスタムイメージをビルドする
+    info "Resolver イメージ (openhands-resolver:local) をビルドしています..."
+    if docker build -t openhands-resolver:local "${PROJECT_DIR}/resolver/" ; then
+        info "Resolver イメージのビルド完了"
+    else
+        warn "Resolver イメージのビルドに失敗しました"
+        warn "後から手動でビルドしてください: docker build -t openhands-resolver:local ./resolver/"
+    fi
+
     echo ""
     echo "=============================================="
     info "セットアップ完了！"
@@ -502,6 +512,9 @@ main() {
     echo ""
     echo "  # ローカル GitLab の場合:"
     echo "  docker compose --profile local up -d"
+    echo ""
+    echo "※ Resolver イメージ (openhands-resolver:local) は上記で自動ビルド済みです"
+    echo "  再ビルドが必要な場合: docker build -t openhands-resolver:local ./resolver/"
     echo ""
     echo "アクセス先:"
     echo "  GitLab:    ${GITLAB_URL}"

@@ -35,6 +35,7 @@ GitLab の Issue / MR をトリガーに OpenHands Resolver が自動実装・MR
 | gitlab | `gitlab/gitlab-ce:latest` | 8080 / 2222 | `--profile local` 指定時のみ | ソースコード管理・Issue管理 |
 | openhands | `docker.openhands.dev/openhands/openhands:1.5` | 3000 | 常時 | OpenHands Web UI |
 | openhands-webhook | `./webhook`（独自ビルド） | 5000 | 常時 | GitLab Webhook 受信 → Resolver 起動 |
+| openhands-resolver-image | `./resolver`（独自ビルド） | - | ビルド専用（`--profile build-only`） | Resolver 用イメージのビルド定義（実コンテナは docker run で動的生成） |
 
 ---
 
@@ -319,6 +320,19 @@ curl http://localhost:5000/health
 # 設定不足: {"status": "warning", "missing_env": ["GITLAB_TOKEN"]}
 ```
 
+### Resolver イメージ
+
+`openhands:1.5` は `git` を含まないため、[resolver/Dockerfile](resolver/Dockerfile) で `git` を追加したカスタムイメージ `openhands-resolver:local` をビルドして使用しています。
+
+```bash
+# 初回ビルド（setup.sh 実行前に一度だけ実行）
+docker build -t openhands-resolver:local ./resolver/
+
+# ベースイメージを更新したいとき（例: openhands:1.5 → 1.x に上げた後）
+# resolver/Dockerfile の FROM 行を変更してから再ビルド
+docker build --no-cache -t openhands-resolver:local ./resolver/
+```
+
 ### Resolver の起動パラメータ
 
 Webhook Receiver は以下の環境変数を付けて OpenHands Resolver コンテナを `docker run` する。
@@ -416,6 +430,9 @@ docker compose --profile local down        # ローカル GitLab モード
 # 完全リセット（GitLab データも削除、ローカルモードのみ）
 docker compose --profile local down -v
 rm -rf /tmp/openhands-resolver-workspace
+
+# Resolver イメージの再ビルド（resolver/Dockerfile を変更したとき）
+docker build -t openhands-resolver:local ./resolver/
 ```
 
 ---

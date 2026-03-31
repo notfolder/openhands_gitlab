@@ -89,6 +89,17 @@ services:
     stdin_open: true
     tty: true
 
+  # ─── OpenHands Resolver イメージビルダー ────────────────────────────────────────
+  # git を含む resolver 専用イメージをビルドするためのサービス。
+  # 実際にはコンテナとして起動せず、イメージのビルドにのみ使用する。
+  # openhands-webhook が docker run でこのイメージを使って resolver を起動する。
+  openhands-resolver-image:
+    build:
+      context: ./resolver
+    image: openhands-resolver:local
+    profiles: [build-only]    # 通常の up では起動しない
+    command: echo "resolver image built"
+
   # ─── Webhook Receiver (GitLab → OpenHands Resolver トリガー) ──────────────────
   openhands-webhook:
     build:
@@ -112,7 +123,7 @@ services:
       - TRIGGER_LABEL=${TRIGGER_LABEL:-openhands}
       - TRIGGER_MENTION=${TRIGGER_MENTION:-@openhands}
       - RESOLVER_NETWORK=openhands-net
-      - OPENHANDS_IMAGE=docker.openhands.dev/openhands/openhands:1.5
+      - OPENHANDS_IMAGE=openhands-resolver:local
       - AGENT_SERVER_IMAGE_TAG=1.12.0-python
       - RESOLVER_WORKSPACE_HOST_PATH=/tmp/openhands-resolver-workspace
       # ローカル GitLab (HTTP) 用の自己署名証明書パス（setup.sh が自動設定）

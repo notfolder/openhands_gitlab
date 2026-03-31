@@ -111,9 +111,10 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         "--selected-repo", repo_path,
         "--issue-number", str(issue_number),
         "--issue-type", issue_type,
+        "--output-dir", str(workspace_path),
         "--token", GITLAB_TOKEN,
         "--username", GITLAB_USERNAME,
-        "--base-domain", GITLAB_BASE_URL,
+        "--base-domain", GIT_BASE_DOMAIN,
         "--llm-model", LLM_MODEL,
         "--llm-api-key", LLM_API_KEY,
         # LiteLLM proxy 等 OpenAI 互換 API の場合のみ設定（空なら OpenAI 直接）
