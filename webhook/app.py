@@ -30,8 +30,13 @@ app = Flask(__name__)
 
 # ─── 環境変数 ─────────────────────────────────────────────────────────────────
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
+GITLAB_USERNAME = os.environ.get("GITLAB_USERNAME", "openhands")
 GITLAB_BASE_URL = os.environ.get("GITLAB_BASE_URL", "http://host.docker.internal:8080")
 GIT_BASE_DOMAIN = os.environ.get("GIT_BASE_DOMAIN", "host.docker.internal:8080")
+# ローカル GitLab 用の自己署名証明書パス（ホスト上のパス）
+# setup.sh がローカル GitLab を検出した場合に自動設定する。
+# 外部 HTTPS GitLab の場合は空のままでよい。
+GITLAB_SSL_CERT = os.environ.get("GITLAB_SSL_CERT", "")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
 LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-4.1")
 # OpenAI 互換 API (LiteLLM proxy 等) を使う場合に設定。空なら OpenAI 直接接続。
@@ -81,15 +86,6 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
     cmd = [
         "docker", "run", "--rm",
         "--name", container_name,
-        # GitLab 認証
-        "-e", f"GITLAB_TOKEN={GITLAB_TOKEN}",
-        "-e", f"GITLAB_BASE_URL={GITLAB_BASE_URL}",
-        "-e", f"GIT_BASE_DOMAIN={GIT_BASE_DOMAIN}",
-        # LLM
-        "-e", f"LLM_API_KEY={LLM_API_KEY}",
-        "-e", f"LLM_MODEL={LLM_MODEL}",
-        # LiteLLM proxy 等 OpenAI 互換 API の場合のみ設定（空なら OpenAI 直接）
-        *(["-e", f"LLM_BASE_URL={LLM_BASE_URL}"] if LLM_BASE_URL else []),
         # Agent Server
         "-e", "AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server",
         "-e", f"AGENT_SERVER_IMAGE_TAG={AGENT_SERVER_IMAGE_TAG}",
@@ -100,14 +96,28 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
         # Workspace マウント (ホストパス = コンテナ内パスで揃えている)
         "-v", f"{workspace_path}:{workspace_path}",
+        # ローカル GitLab 用の自己署名証明書（設定されている場合のみ）
+        # SSL_CERT_FILE: Python httpx が信頼する CA 証明書
+        # GIT_SSL_CAINFO: git clone/push が信頼する CA 証明書
+        *((["-v", f"{GITLAB_SSL_CERT}:{GITLAB_SSL_CERT}:ro",
+            "-e", f"SSL_CERT_FILE={GITLAB_SSL_CERT}",
+            "-e", f"GIT_SSL_CAINFO={GITLAB_SSL_CERT}"]
+           ) if GITLAB_SSL_CERT else []),
         # ネットワーク (GitLab と同一ネットワークで名前解決)
         "--network", RESOLVER_NETWORK,
         "--add-host", "host.docker.internal:host-gateway",
         OPENHANDS_IMAGE,
         "python", "-m", "openhands.resolver.resolve_issue",
-        "--repo", repo_path,
+        "--selected-repo", repo_path,
         "--issue-number", str(issue_number),
         "--issue-type", issue_type,
+        "--token", GITLAB_TOKEN,
+        "--username", GITLAB_USERNAME,
+        "--base-domain", GITLAB_BASE_URL,
+        "--llm-model", LLM_MODEL,
+        "--llm-api-key", LLM_API_KEY,
+        # LiteLLM proxy 等 OpenAI 互換 API の場合のみ設定（空なら OpenAI 直接）
+        *(["--llm-base-url", LLM_BASE_URL] if LLM_BASE_URL else []),
     ]
 
     try:

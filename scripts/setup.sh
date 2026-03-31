@@ -423,19 +423,62 @@ main() {
     local openhands_user
     openhands_user=$(verify_token)
 
-    # Webhook / GitLab の接続情報を .env に保存
-    # （Webhook コンテナが Resolver 起動時に使う）
-    local git_domain
-    git_domain=$(echo "${GITLAB_URL}" | python3 -c \
-        "import sys; from urllib.parse import urlparse; u=urlparse(sys.stdin.read().strip()); print(u.netloc)")
-    update_env_key "GITLAB_BASE_URL" "${GITLAB_URL}"
-    update_env_key "GIT_BASE_DOMAIN" "${git_domain}"
-    info ".env に GITLAB_BASE_URL / GIT_BASE_DOMAIN を保存しました"
-
     # OS 判定（DOCKER_HOST_INTERNAL を .env に保存）
     local docker_host
     docker_host=$(detect_docker_host)
     update_env_key "DOCKER_HOST_INTERNAL" "${docker_host}"
+
+    # Webhook / GitLab の接続情報を .env に保存
+    # （Webhook コンテナが Resolver 起動時に使う）
+    #
+    # ローカル GitLab（localhost/127.0.0.1）の場合:
+    #   Resolver の GitLab resolver は常に https:// を使うため、
+    #   nginx SSL プロキシ（gitlab-ssl-proxy）経由でアクセスする。
+    #   GITLAB_BASE_URL = https://gitlab-ssl-proxy
+    #   GIT_BASE_DOMAIN = gitlab-ssl-proxy
+    #   GITLAB_SSL_CERT  = 自己署名証明書のホストパス
+    #
+    # 外部 GitLab の場合:
+    #   GITLAB_BASE_URL = GITLAB_EXTERNAL_URL のまま
+    #   GIT_BASE_DOMAIN = extracted domain
+    #   GITLAB_SSL_CERT  = 空（システム証明書を使用）
+    # GitLab が HTTP かどうかで SSL プロキシの要否を判断する
+    local use_ssl_proxy=false
+    if echo "${GITLAB_URL}" | grep -q "^http://"; then
+        use_ssl_proxy=true
+    fi
+
+    if [[ "$use_ssl_proxy" == "true" ]]; then
+        local ssl_cert_path="/tmp/openhands-gitlab-ssl/server.crt"
+
+        # ローカル GitLab か外部 GitLab かで upstream を分ける
+        local upstream_url
+        if echo "${GITLAB_URL}" | grep -qE "(localhost|127\.0\.0\.1)"; then
+            # ローカル: Docker ネットワーク内の gitlab コンテナに向ける
+            upstream_url="http://gitlab:80"
+        else
+            # 外部 HTTP GitLab: そのままの URL を upstream にする
+            upstream_url="${GITLAB_URL}"
+        fi
+
+        update_env_key "GITLAB_UPSTREAM_URL" "${upstream_url}"
+        update_env_key "GITLAB_BASE_URL" "https://gitlab-ssl-proxy"
+        update_env_key "GIT_BASE_DOMAIN" "gitlab-ssl-proxy"
+        update_env_key "GITLAB_SSL_CERT"  "${ssl_cert_path}"
+        info ".env に GITLAB_BASE_URL=https://gitlab-ssl-proxy を保存しました"
+        info "  upstream: ${upstream_url}"
+        info "SSL 証明書: ${ssl_cert_path}（gitlab-ssl-proxy コンテナ起動時に生成）"
+        warn "コンテナ起動後に証明書が生成されます: docker compose up -d gitlab-ssl-proxy"
+    else
+        local git_domain
+        git_domain=$(echo "${GITLAB_URL}" | python3 -c \
+            "import sys; from urllib.parse import urlparse; u=urlparse(sys.stdin.read().strip()); print(u.netloc)")
+        update_env_key "GITLAB_UPSTREAM_URL" ""
+        update_env_key "GITLAB_BASE_URL" "${GITLAB_URL}"
+        update_env_key "GIT_BASE_DOMAIN" "${git_domain}"
+        update_env_key "GITLAB_SSL_CERT"  ""
+        info ".env に GITLAB_BASE_URL / GIT_BASE_DOMAIN を保存しました"
+    fi
 
     # グループ作成
     local group_id
