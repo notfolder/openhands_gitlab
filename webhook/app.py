@@ -398,6 +398,7 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
             "--username", GITLAB_USERNAME,
             "--base-domain", GIT_BASE_DOMAIN,
             "--pr-type", "ready",
+            "--send-on-failure",
             "--llm-model", LLM_MODEL,
             "--llm-api-key", LLM_API_KEY,
             "--git-user-name", GITLAB_USERNAME,
