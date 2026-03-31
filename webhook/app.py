@@ -106,6 +106,10 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         # DooD: Runtime コンテナへの接続先を host.docker.internal に強制設定
         # docker_runtime.py の __init__ で local_runtime_url を上書きする
         "-e", "DOCKER_HOST_ADDR=host.docker.internal",
+        # LLM 設定 (--llm-model 等の CLI 引数は v1.5 で無視される。環境変数で渡す)
+        "-e", f"LLM_MODEL={LLM_MODEL}",
+        "-e", f"LLM_API_KEY={LLM_API_KEY}",
+        *((["-e", f"LLM_BASE_URL={LLM_BASE_URL}"]) if LLM_BASE_URL else []),
         # ネットワーク (GitLab と同一ネットワークで名前解決)
         "--network", RESOLVER_NETWORK,
         "--add-host", "host.docker.internal:host-gateway",
