@@ -1,0 +1,7 @@
+[sandbox]
+# DooD (Docker outside of Docker) 構成:
+# Resolver コンテナ内の localhost は自分自身を指すため、
+# OpenHands が Runtime コンテナに接続する URL を host.docker.internal に変更する。
+# Runtime コンテナのポートはホストの 0.0.0.0 にパブリッシュされるので
+# host.docker.internal:<port> 経由でアクセス可能。
+local_runtime_url = "http://host.docker.internal"

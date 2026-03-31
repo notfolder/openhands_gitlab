@@ -103,13 +103,12 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
             "-e", f"SSL_CERT_FILE={GITLAB_SSL_CERT}",
             "-e", f"GIT_SSL_CAINFO={GITLAB_SSL_CERT}"]
            ) if GITLAB_SSL_CERT else []),
+        # DooD: Runtime コンテナへの接続先を host.docker.internal に強制設定
+        # docker_runtime.py の __init__ で local_runtime_url を上書きする
+        "-e", "DOCKER_HOST_ADDR=host.docker.internal",
         # ネットワーク (GitLab と同一ネットワークで名前解決)
         "--network", RESOLVER_NETWORK,
         "--add-host", "host.docker.internal:host-gateway",
-        # DooD: Resolver コンテナ内の localhost は Docker ホストではないため、
-        # OpenHands が Runtime コンテナに接続する URL を host.docker.internal に変更する。
-        # Runtime のポートはホストにパブリッシュされるので、host.docker.internal 経由でアクセスできる。
-        "-e", "SANDBOX_LOCAL_RUNTIME_URL=http://host.docker.internal",
         OPENHANDS_IMAGE,
         "python", "-m", "openhands.resolver.resolve_issue",
         "--selected-repo", repo_path,
