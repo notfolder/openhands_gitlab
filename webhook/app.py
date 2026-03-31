@@ -106,9 +106,10 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         # ネットワーク (GitLab と同一ネットワークで名前解決)
         "--network", RESOLVER_NETWORK,
         "--add-host", "host.docker.internal:host-gateway",
-        # DooD: Resolver が起動する Runtime コンテナも同一ネットワークに接続させる。
-        # これにより OpenHands は localhost ではなくコンテナ IP 経由で Runtime と通信する。
-        "-e", f"SANDBOX_DOCKER_NETWORK={RESOLVER_NETWORK}",
+        # DooD: Resolver コンテナ内の localhost は Docker ホストではないため、
+        # OpenHands が Runtime コンテナに接続する URL を host.docker.internal に変更する。
+        # Runtime のポートはホストにパブリッシュされるので、host.docker.internal 経由でアクセスできる。
+        "-e", "SANDBOX_LOCAL_RUNTIME_URL=http://host.docker.internal",
         OPENHANDS_IMAGE,
         "python", "-m", "openhands.resolver.resolve_issue",
         "--selected-repo", repo_path,
