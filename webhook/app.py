@@ -22,6 +22,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from collections import deque
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -272,24 +273,37 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
                 )
 
         _ITER_RE = re.compile(r'Iteration\s+(\d+)(?:\s*/\s*(\d+))?', re.IGNORECASE)
-        _THROTTLE_SECS = 30
+        _THROTTLE_SECS = 60
+        _recent_lines: deque = deque(maxlen=20)
 
         def _progress_callback(line: str) -> None:
-            """リーダースレッドから呼ばれる進捗検出コールバック。"""
-            m = _ITER_RE.search(line)
-            if not m:
-                return
+            """リーダースレッドから呼ばれる進捗コールバック。
+
+            全行を rolling 窓に蓄積し、60秒ごとに GitLab コメントを更新する。
+            直近20行を <details> で折りたたみ表示し、Iteration があれば先頭に表示する。
+            """
+            _recent_lines.append(line)
             now = time.monotonic()
             if now - progress_state["last_update"] < _THROTTLE_SECS:
                 return
             progress_state["last_update"] = now
-            cur = m.group(1)
-            max_ = m.group(2)
-            iteration_str = f"Iteration {cur}" + (f" / {max_}" if max_ else "")
+
+            # 直近20行から最新の Iteration を逆順サーチ
+            iter_str = None
+            for l in reversed(_recent_lines):
+                m = _ITER_RE.search(l)
+                if m:
+                    cur, max_ = m.group(1), m.group(2)
+                    iter_str = f"Iteration {cur}" + (f" / {max_}" if max_ else "")
+                    break
+
+            summary = "\n".join(_recent_lines)
             body = (
-                f"🔄 **OpenHands** 処理中...\n\n"
-                f"- {iteration_str}\n\n"
-                "完了したら結果をお知らせします。"
+                "🔄 **OpenHands** 処理中...\n\n"
+                + (f"- {iter_str}\n\n" if iter_str else "")
+                + "<details><summary>直近ログ（最大20行）</summary>\n\n"
+                + f"```\n{summary}\n```\n\n</details>\n\n"
+                + "完了したら結果をお知らせします。"
             )
             _upsert_comment(body)
 
