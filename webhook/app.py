@@ -13,10 +13,12 @@ import hmac
 import json
 import logging
 import os
+import re
 import shutil
 import ssl
 import subprocess
 import threading
+import time
 import urllib.parse
 import urllib.request
 import uuid
@@ -90,9 +92,16 @@ def _cleanup(workspace_path: Path, runtime_containers_before: set) -> None:
     logger.info("Cleanup done: workspace=%s", workspace_path)
 
 
-def _run_docker_streaming(cmd: list, prefix: str, timeout: int) -> tuple[int, list[str]]:
+def _run_docker_streaming(
+    cmd: list,
+    prefix: str,
+    timeout: int,
+    line_callback=None,
+) -> tuple[int, list[str]]:
     """docker run をストリーミング実行し、各行を webhook ログにリアルタイム転送する。
 
+    line_callback: 各行を引数に呼び出されるオプションのコールバック。
+                   リーダースレッド内で呼ばれるため、スレッドセーフに実装すること。
     Returns: (returncode, output_lines)
       returncode == -1 はタイムアウトまたは起動失敗を示す。
     """
@@ -116,6 +125,11 @@ def _run_docker_streaming(cmd: list, prefix: str, timeout: int) -> tuple[int, li
                 stripped = line.rstrip()
                 output_lines.append(stripped)
                 logger.info("[%s] %s", prefix, stripped)
+                if line_callback:
+                    try:
+                        line_callback(stripped)
+                    except Exception:
+                        logger.debug("line_callback error", exc_info=True)
         except Exception:
             pass
 
@@ -133,26 +147,35 @@ def _run_docker_streaming(cmd: list, prefix: str, timeout: int) -> tuple[int, li
     return proc.returncode, output_lines
 
 
-def _post_gitlab_comment(
-    repo_path: str, issue_number: int, issue_type: str, body: str
-) -> None:
-    """GitLab イシュー / MR にコメントを投稿する。失敗してもエラーはログのみ。
+def _make_ssl_ctx() -> ssl.SSLContext:
+    """GitLab 向け SSL コンテキストを生成する。"""
+    ctx = ssl.create_default_context()
+    if GITLAB_SSL_CERT and os.path.exists(GITLAB_SSL_CERT):
+        ctx.load_verify_locations(cafile=GITLAB_SSL_CERT)
+    return ctx
 
-    issue_type == "issue" → /issues/{N}/notes
-    issue_type == "pr"    → /merge_requests/{N}/notes
-    """
+
+def _gitlab_notes_url(repo_path: str, issue_number: int, issue_type: str) -> str:
+    """GitLab Notes エンドポイント URL を返す。"""
     endpoint = (
         f"merge_requests/{issue_number}/notes"
         if issue_type == "pr"
         else f"issues/{issue_number}/notes"
     )
     encoded_repo = urllib.parse.quote(repo_path, safe="")
-    url = f"{GITLAB_BASE_URL}/api/v4/projects/{encoded_repo}/{endpoint}"
+    return f"{GITLAB_BASE_URL}/api/v4/projects/{encoded_repo}/{endpoint}"
 
-    ssl_ctx = ssl.create_default_context()
-    if GITLAB_SSL_CERT and os.path.exists(GITLAB_SSL_CERT):
-        ssl_ctx.load_verify_locations(cafile=GITLAB_SSL_CERT)
 
+def _post_gitlab_comment(
+    repo_path: str, issue_number: int, issue_type: str, body: str
+) -> int | None:
+    """GitLab イシュー / MR にコメントを新規投稿する。
+
+    Returns: 作成された note の id。失敗時は None。
+    issue_type == "issue" → /issues/{N}/notes
+    issue_type == "pr"    → /merge_requests/{N}/notes
+    """
+    url = _gitlab_notes_url(repo_path, issue_number, issue_type)
     data = json.dumps({"body": body}).encode()
     req = urllib.request.Request(
         url,
@@ -163,15 +186,48 @@ def _post_gitlab_comment(
         },
     )
     try:
-        with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+        with urllib.request.urlopen(req, context=_make_ssl_ctx(), timeout=10) as resp:
+            note = json.loads(resp.read())
+            note_id = note.get("id")
             logger.info(
-                "Posted GitLab comment: %s #%s status=%s",
-                issue_type, issue_number, resp.status,
+                "Posted GitLab comment: %s #%s note_id=%s",
+                issue_type, issue_number, note_id,
             )
+            return note_id
     except Exception:
         logger.warning(
             "Failed to post GitLab comment: %s #%s",
             issue_type, issue_number, exc_info=True,
+        )
+        return None
+
+
+def _update_gitlab_comment(
+    repo_path: str, issue_number: int, issue_type: str, note_id: int, body: str
+) -> None:
+    """GitLab の既存 note を PUT で更新する。失敗してもエラーはログのみ。"""
+    base_url = _gitlab_notes_url(repo_path, issue_number, issue_type)
+    url = f"{base_url}/{note_id}"
+    data = json.dumps({"body": body}).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {GITLAB_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, context=_make_ssl_ctx(), timeout=10) as resp:
+            logger.info(
+                "Updated GitLab comment: %s #%s note_id=%s status=%s",
+                issue_type, issue_number, note_id, resp.status,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to update GitLab comment: %s #%s note_id=%s",
+            issue_type, issue_number, note_id, exc_info=True,
         )
 
 
@@ -198,11 +254,44 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
             workspace_path,
         )
 
-        # 処理開始を GitLab にコメントで通知
-        _post_gitlab_comment(
-            repo_path, issue_number, issue_type,
-            "🤖 **OpenHands** がこのイシューに取り組んでいます。\n\n完了したら結果をお知らせします。",
-        )
+        # 処理開始を GitLab にコメントで通知（note_id を保持して後で更新する）
+        _start_body = "🤖 **OpenHands** がこのイシューに取り組んでいます。\n\n完了したら結果をお知らせします。"
+        progress_state = {
+            "note_id": _post_gitlab_comment(repo_path, issue_number, issue_type, _start_body),
+            "last_update": 0.0,  # epoch seconds
+        }
+
+        def _upsert_comment(body: str) -> None:
+            """note_id があれば更新、なければ新規投稿してIDを保存する。"""
+            nid = progress_state["note_id"]
+            if nid is not None:
+                _update_gitlab_comment(repo_path, issue_number, issue_type, nid, body)
+            else:
+                progress_state["note_id"] = _post_gitlab_comment(
+                    repo_path, issue_number, issue_type, body
+                )
+
+        _ITER_RE = re.compile(r'Iteration\s+(\d+)(?:\s*/\s*(\d+))?', re.IGNORECASE)
+        _THROTTLE_SECS = 30
+
+        def _progress_callback(line: str) -> None:
+            """リーダースレッドから呼ばれる進捗検出コールバック。"""
+            m = _ITER_RE.search(line)
+            if not m:
+                return
+            now = time.monotonic()
+            if now - progress_state["last_update"] < _THROTTLE_SECS:
+                return
+            progress_state["last_update"] = now
+            cur = m.group(1)
+            max_ = m.group(2)
+            iteration_str = f"Iteration {cur}" + (f" / {max_}" if max_ else "")
+            body = (
+                f"🔄 **OpenHands** 処理中...\n\n"
+                f"- {iteration_str}\n\n"
+                "完了したら結果をお知らせします。"
+            )
+            _upsert_comment(body)
 
         cmd = [
             "docker", "run", "--rm",
@@ -250,21 +339,15 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         ]
 
         # ─── Resolver 実行（ストリーミング） ─────────────────────────────────
-        returncode, _ = _run_docker_streaming(cmd, container_name, 3600)
+        returncode, _ = _run_docker_streaming(cmd, container_name, 3600, line_callback=_progress_callback)
         if returncode == -1:
             logger.error("Resolver timed out: container=%s", container_name)
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
-            _post_gitlab_comment(
-                repo_path, issue_number, issue_type,
-                "⏱️ **OpenHands** の処理がタイムアウトしました（上限 1 時間）。",
-            )
+            _upsert_comment("⏱️ **OpenHands** の処理がタイムアウトしました（上限 1 時間）。")
             return
         elif returncode != 0:
             logger.error("Resolver failed: container=%s returncode=%s", container_name, returncode)
-            _post_gitlab_comment(
-                repo_path, issue_number, issue_type,
-                "❌ **OpenHands** の処理が失敗しました。`docker logs` でログを確認してください。",
-            )
+            _upsert_comment("❌ **OpenHands** の処理が失敗しました。`docker logs` でログを確認してください。")
             return
 
         logger.info("Resolver finished successfully: container=%s", container_name)
@@ -312,19 +395,13 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         if mr_returncode == -1:
             logger.error("MR creation timed out: repo=%s issue=%s", repo_path, issue_number)
             subprocess.run(["docker", "rm", "-f", mr_container_name], capture_output=True)
-            _post_gitlab_comment(
-                repo_path, issue_number, issue_type,
-                "⚠️ **OpenHands** はコードを生成しましたが、MR 作成がタイムアウトしました。",
-            )
+            _upsert_comment("⚠️ **OpenHands** はコードを生成しましたが、MR 作成がタイムアウトしました。")
         elif mr_returncode != 0:
             logger.error(
                 "MR creation failed: repo=%s issue=%s returncode=%s",
                 repo_path, issue_number, mr_returncode,
             )
-            _post_gitlab_comment(
-                repo_path, issue_number, issue_type,
-                "⚠️ **OpenHands** はコードを生成しましたが、MR の作成に失敗しました。ログを確認してください。",
-            )
+            _upsert_comment("⚠️ **OpenHands** はコードを生成しましたが、MR の作成に失敗しました。ログを確認してください。")
         else:
             # ログ出力から MR URL を抽出（例: "ready created: https://..."）
             mr_url = next(
@@ -338,7 +415,7 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
             msg = "✅ **OpenHands** による修正が完了しました。"
             if mr_url:
                 msg += f"\n\nMR: {mr_url}"
-            _post_gitlab_comment(repo_path, issue_number, issue_type, msg)
+            _upsert_comment(msg)
             logger.info(
                 "MR created successfully: repo=%s issue=%s url=%s",
                 repo_path, issue_number, mr_url,
