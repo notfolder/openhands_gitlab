@@ -145,11 +145,77 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
                 result.stdout[-2000:],
                 result.stderr[-2000:],
             )
+            return
     except subprocess.TimeoutExpired:
         logger.error("Resolver timed out: container=%s", container_name)
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+        return
     except Exception:
         logger.exception("Unexpected error running resolver: container=%s", container_name)
+        return
+
+    # ─── MR 作成 ────────────────────────────────────────────────────────────────
+    # resolve_issue.py はコード変更と output.jsonl の生成のみ行う。
+    # send_pull_request.py が branch push + GitLab MR 作成を担当する。
+    mr_container_name = f"openhands-mr-{issue_number}-{run_id}"
+    logger.info("Creating MR: repo=%s issue=%s", repo_path, issue_number)
+
+    mr_cmd = [
+        "docker", "run", "--rm",
+        "--name", mr_container_name,
+        # SSL 証明書（設定されている場合のみ）
+        *((["-v", f"{GITLAB_SSL_CERT}:{GITLAB_SSL_CERT}:ro",
+            "-e", f"SSL_CERT_FILE={GITLAB_SSL_CERT}",
+            "-e", f"GIT_SSL_CAINFO={GITLAB_SSL_CERT}"]
+           ) if GITLAB_SSL_CERT else []),
+        # LLM (MR タイトル・説明の生成に使用)
+        "-e", f"LLM_MODEL={LLM_MODEL}",
+        "-e", f"LLM_API_KEY={LLM_API_KEY}",
+        *((["-e", f"LLM_BASE_URL={LLM_BASE_URL}"]) if LLM_BASE_URL else []),
+        # Workspace マウント (output.jsonl の読み込みのため)
+        "-v", f"{workspace_path}:{workspace_path}",
+        # ネットワーク
+        "--network", RESOLVER_NETWORK,
+        "--add-host", "host.docker.internal:host-gateway",
+        OPENHANDS_IMAGE,
+        "python", "-m", "openhands.resolver.send_pull_request",
+        "--selected-repo", repo_path,
+        "--issue-number", str(issue_number),
+        "--output-dir", str(workspace_path),
+        "--token", GITLAB_TOKEN,
+        "--username", GITLAB_USERNAME,
+        "--base-domain", GIT_BASE_DOMAIN,
+        "--pr-type", "ready",
+        "--llm-model", LLM_MODEL,
+        "--llm-api-key", LLM_API_KEY,
+        "--git-user-name", GITLAB_USERNAME,
+        "--git-user-email", f"{GITLAB_USERNAME}@localhost.local",
+        *(["--llm-base-url", LLM_BASE_URL] if LLM_BASE_URL else []),
+    ]
+
+    try:
+        mr_result = subprocess.run(
+            mr_cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 最大5分
+        )
+        if mr_result.returncode == 0:
+            logger.info("MR created successfully: repo=%s issue=%s", repo_path, issue_number)
+        else:
+            logger.error(
+                "MR creation failed: repo=%s issue=%s returncode=%s\nstdout=%s\nstderr=%s",
+                repo_path,
+                issue_number,
+                mr_result.returncode,
+                mr_result.stdout[-2000:],
+                mr_result.stderr[-2000:],
+            )
+    except subprocess.TimeoutExpired:
+        logger.error("MR creation timed out: repo=%s issue=%s", repo_path, issue_number)
+        subprocess.run(["docker", "rm", "-f", mr_container_name], capture_output=True)
+    except Exception:
+        logger.exception("Unexpected error creating MR: repo=%s issue=%s", repo_path, issue_number)
 
 
 def trigger_resolver_async(repo_path: str, issue_number: int, issue_type: str) -> None:
