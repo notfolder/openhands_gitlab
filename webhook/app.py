@@ -10,10 +10,15 @@ DooD (Docker outside of Docker) 構成:
 """
 
 import hmac
+import json
 import logging
 import os
+import shutil
+import ssl
 import subprocess
 import threading
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 
@@ -62,6 +67,114 @@ def verify_gitlab_token(request_token: str) -> bool:
     return hmac.compare_digest(request_token, WEBHOOK_SECRET)
 
 
+# ─── クリーンアップヘルパー ────────────────────────────────────────────────────
+def _get_runtime_containers() -> set:
+    """現在存在する openhands-runtime-* コンテナ名を取得する。"""
+    result = subprocess.run(
+        ["docker", "ps", "-a", "--filter", "name=openhands-runtime-", "--format", "{{.Names}}"],
+        capture_output=True, text=True,
+    )
+    return set(result.stdout.strip().splitlines()) if result.returncode == 0 else set()
+
+
+def _cleanup(workspace_path: Path, runtime_containers_before: set) -> None:
+    """Resolver 実行後に Runtime コンテナとワークスペースを削除する。"""
+    # Resolver が起動した Runtime コンテナを削除
+    after = _get_runtime_containers()
+    for name in after - runtime_containers_before:
+        logger.info("Removing runtime container: %s", name)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+    # ワークスペースディレクトリを削除
+    shutil.rmtree(workspace_path, ignore_errors=True)
+    logger.info("Cleanup done: workspace=%s", workspace_path)
+
+
+def _run_docker_streaming(cmd: list, prefix: str, timeout: int) -> tuple[int, list[str]]:
+    """docker run をストリーミング実行し、各行を webhook ログにリアルタイム転送する。
+
+    Returns: (returncode, output_lines)
+      returncode == -1 はタイムアウトまたは起動失敗を示す。
+    """
+    output_lines: list[str] = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except Exception:
+        logger.exception("Failed to start docker process: prefix=%s", prefix)
+        return -1, []
+
+    def _reader() -> None:
+        try:
+            for line in proc.stdout:
+                stripped = line.rstrip()
+                output_lines.append(stripped)
+                logger.info("[%s] %s", prefix, stripped)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        reader.join(timeout=5)
+        return -1, output_lines
+
+    reader.join(timeout=10)
+    return proc.returncode, output_lines
+
+
+def _post_gitlab_comment(
+    repo_path: str, issue_number: int, issue_type: str, body: str
+) -> None:
+    """GitLab イシュー / MR にコメントを投稿する。失敗してもエラーはログのみ。
+
+    issue_type == "issue" → /issues/{N}/notes
+    issue_type == "pr"    → /merge_requests/{N}/notes
+    """
+    endpoint = (
+        f"merge_requests/{issue_number}/notes"
+        if issue_type == "pr"
+        else f"issues/{issue_number}/notes"
+    )
+    encoded_repo = urllib.parse.quote(repo_path, safe="")
+    url = f"{GITLAB_BASE_URL}/api/v4/projects/{encoded_repo}/{endpoint}"
+
+    ssl_ctx = ssl.create_default_context()
+    if GITLAB_SSL_CERT and os.path.exists(GITLAB_SSL_CERT):
+        ssl_ctx.load_verify_locations(cafile=GITLAB_SSL_CERT)
+
+    data = json.dumps({"body": body}).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {GITLAB_TOKEN}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, context=ssl_ctx, timeout=10) as resp:
+            logger.info(
+                "Posted GitLab comment: %s #%s status=%s",
+                issue_type, issue_number, resp.status,
+            )
+    except Exception:
+        logger.warning(
+            "Failed to post GitLab comment: %s #%s",
+            issue_type, issue_number, exc_info=True,
+        )
+
+
 # ─── Resolver 起動 ───────────────────────────────────────────────────────────
 def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -> None:
     """
@@ -73,149 +186,168 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
     run_id = uuid.uuid4().hex[:8]
     workspace_path = Path(RESOLVER_WORKSPACE_HOST_PATH) / f"{issue_number}-{run_id}"
     workspace_path.mkdir(parents=True, exist_ok=True)
-
-    container_name = f"openhands-resolver-{issue_number}-{run_id}"
-    logger.info(
-        "Starting resolver: repo=%s issue=%s type=%s workspace=%s",
-        repo_path,
-        issue_number,
-        issue_type,
-        workspace_path,
-    )
-
-    cmd = [
-        "docker", "run", "--rm",
-        "--name", container_name,
-        # Agent Server
-        "-e", "AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server",
-        "-e", f"AGENT_SERVER_IMAGE_TAG={AGENT_SERVER_IMAGE_TAG}",
-        # Workspace (DooD: ホストパスを指定)
-        "-e", f"WORKSPACE_BASE={workspace_path}",
-        "-e", "WORKSPACE_MOUNT_PATH=/workspace",
-        # Docker socket (サンドボックスコンテナ起動のため)
-        "-v", "/var/run/docker.sock:/var/run/docker.sock",
-        # Workspace マウント (ホストパス = コンテナ内パスで揃えている)
-        "-v", f"{workspace_path}:{workspace_path}",
-        # ローカル GitLab 用の自己署名証明書（設定されている場合のみ）
-        # SSL_CERT_FILE: Python httpx が信頼する CA 証明書
-        # GIT_SSL_CAINFO: git clone/push が信頼する CA 証明書
-        *((["-v", f"{GITLAB_SSL_CERT}:{GITLAB_SSL_CERT}:ro",
-            "-e", f"SSL_CERT_FILE={GITLAB_SSL_CERT}",
-            "-e", f"GIT_SSL_CAINFO={GITLAB_SSL_CERT}"]
-           ) if GITLAB_SSL_CERT else []),
-        # DooD: Runtime コンテナへの接続先を host.docker.internal に強制設定
-        # docker_runtime.py の __init__ で local_runtime_url を上書きする
-        "-e", "DOCKER_HOST_ADDR=host.docker.internal",
-        # LLM 設定 (--llm-model 等の CLI 引数は v1.5 で無視される。環境変数で渡す)
-        "-e", f"LLM_MODEL={LLM_MODEL}",
-        "-e", f"LLM_API_KEY={LLM_API_KEY}",
-        *((["-e", f"LLM_BASE_URL={LLM_BASE_URL}"]) if LLM_BASE_URL else []),
-        # ネットワーク (GitLab と同一ネットワークで名前解決)
-        "--network", RESOLVER_NETWORK,
-        "--add-host", "host.docker.internal:host-gateway",
-        OPENHANDS_IMAGE,
-        "python", "-m", "openhands.resolver.resolve_issue",
-        "--selected-repo", repo_path,
-        "--issue-number", str(issue_number),
-        "--issue-type", issue_type,
-        "--output-dir", str(workspace_path),
-        "--token", GITLAB_TOKEN,
-        "--username", GITLAB_USERNAME,
-        "--base-domain", GIT_BASE_DOMAIN,
-        "--llm-model", LLM_MODEL,
-        "--llm-api-key", LLM_API_KEY,
-        # LiteLLM proxy 等 OpenAI 互換 API の場合のみ設定（空なら OpenAI 直接）
-        *(["--llm-base-url", LLM_BASE_URL] if LLM_BASE_URL else []),
-    ]
+    runtime_containers_before = _get_runtime_containers()
 
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=3600,  # 最大1時間
+        container_name = f"openhands-resolver-{issue_number}-{run_id}"
+        logger.info(
+            "Starting resolver: repo=%s issue=%s type=%s workspace=%s",
+            repo_path,
+            issue_number,
+            issue_type,
+            workspace_path,
         )
-        if result.returncode == 0:
-            logger.info("Resolver finished successfully: container=%s", container_name)
-        else:
-            logger.error(
-                "Resolver failed: container=%s returncode=%s\nstdout=%s\nstderr=%s",
-                container_name,
-                result.returncode,
-                result.stdout[-2000:],
-                result.stderr[-2000:],
+
+        # 処理開始を GitLab にコメントで通知
+        _post_gitlab_comment(
+            repo_path, issue_number, issue_type,
+            "🤖 **OpenHands** がこのイシューに取り組んでいます。\n\n完了したら結果をお知らせします。",
+        )
+
+        cmd = [
+            "docker", "run", "--rm",
+            "--name", container_name,
+            # Agent Server
+            "-e", "AGENT_SERVER_IMAGE_REPOSITORY=ghcr.io/openhands/agent-server",
+            "-e", f"AGENT_SERVER_IMAGE_TAG={AGENT_SERVER_IMAGE_TAG}",
+            # Workspace (DooD: ホストパスを指定)
+            "-e", f"WORKSPACE_BASE={workspace_path}",
+            "-e", "WORKSPACE_MOUNT_PATH=/workspace",
+            # Docker socket (サンドボックスコンテナ起動のため)
+            "-v", "/var/run/docker.sock:/var/run/docker.sock",
+            # Workspace マウント (ホストパス = コンテナ内パスで揃えている)
+            "-v", f"{workspace_path}:{workspace_path}",
+            # ローカル GitLab 用の自己署名証明書（設定されている場合のみ）
+            # SSL_CERT_FILE: Python httpx が信頼する CA 証明書
+            # GIT_SSL_CAINFO: git clone/push が信頼する CA 証明書
+            *((["-v", f"{GITLAB_SSL_CERT}:{GITLAB_SSL_CERT}:ro",
+                "-e", f"SSL_CERT_FILE={GITLAB_SSL_CERT}",
+                "-e", f"GIT_SSL_CAINFO={GITLAB_SSL_CERT}"]
+               ) if GITLAB_SSL_CERT else []),
+            # DooD: Runtime コンテナへの接続先を host.docker.internal に強制設定
+            # docker_runtime.py の __init__ で local_runtime_url を上書きする
+            "-e", "DOCKER_HOST_ADDR=host.docker.internal",
+            # LLM 設定 (--llm-model 等の CLI 引数は v1.5 で無視される。環境変数で渡す)
+            "-e", f"LLM_MODEL={LLM_MODEL}",
+            "-e", f"LLM_API_KEY={LLM_API_KEY}",
+            *((["-e", f"LLM_BASE_URL={LLM_BASE_URL}"]) if LLM_BASE_URL else []),
+            # ネットワーク (GitLab と同一ネットワークで名前解決)
+            "--network", RESOLVER_NETWORK,
+            "--add-host", "host.docker.internal:host-gateway",
+            OPENHANDS_IMAGE,
+            "python", "-m", "openhands.resolver.resolve_issue",
+            "--selected-repo", repo_path,
+            "--issue-number", str(issue_number),
+            "--issue-type", issue_type,
+            "--output-dir", str(workspace_path),
+            "--token", GITLAB_TOKEN,
+            "--username", GITLAB_USERNAME,
+            "--base-domain", GIT_BASE_DOMAIN,
+            "--llm-model", LLM_MODEL,
+            "--llm-api-key", LLM_API_KEY,
+            # LiteLLM proxy 等 OpenAI 互換 API の場合のみ設定（空なら OpenAI 直接）
+            *(["--llm-base-url", LLM_BASE_URL] if LLM_BASE_URL else []),
+        ]
+
+        # ─── Resolver 実行（ストリーミング） ─────────────────────────────────
+        returncode, _ = _run_docker_streaming(cmd, container_name, 3600)
+        if returncode == -1:
+            logger.error("Resolver timed out: container=%s", container_name)
+            subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+            _post_gitlab_comment(
+                repo_path, issue_number, issue_type,
+                "⏱️ **OpenHands** の処理がタイムアウトしました（上限 1 時間）。",
             )
             return
-    except subprocess.TimeoutExpired:
-        logger.error("Resolver timed out: container=%s", container_name)
-        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
-        return
-    except Exception:
-        logger.exception("Unexpected error running resolver: container=%s", container_name)
-        return
-
-    # ─── MR 作成 ────────────────────────────────────────────────────────────────
-    # resolve_issue.py はコード変更と output.jsonl の生成のみ行う。
-    # send_pull_request.py が branch push + GitLab MR 作成を担当する。
-    mr_container_name = f"openhands-mr-{issue_number}-{run_id}"
-    logger.info("Creating MR: repo=%s issue=%s", repo_path, issue_number)
-
-    mr_cmd = [
-        "docker", "run", "--rm",
-        "--name", mr_container_name,
-        # SSL 証明書（設定されている場合のみ）
-        *((["-v", f"{GITLAB_SSL_CERT}:{GITLAB_SSL_CERT}:ro",
-            "-e", f"SSL_CERT_FILE={GITLAB_SSL_CERT}",
-            "-e", f"GIT_SSL_CAINFO={GITLAB_SSL_CERT}"]
-           ) if GITLAB_SSL_CERT else []),
-        # LLM (MR タイトル・説明の生成に使用)
-        "-e", f"LLM_MODEL={LLM_MODEL}",
-        "-e", f"LLM_API_KEY={LLM_API_KEY}",
-        *((["-e", f"LLM_BASE_URL={LLM_BASE_URL}"]) if LLM_BASE_URL else []),
-        # Workspace マウント (output.jsonl の読み込みのため)
-        "-v", f"{workspace_path}:{workspace_path}",
-        # ネットワーク
-        "--network", RESOLVER_NETWORK,
-        "--add-host", "host.docker.internal:host-gateway",
-        OPENHANDS_IMAGE,
-        "python", "-m", "openhands.resolver.send_pull_request",
-        "--selected-repo", repo_path,
-        "--issue-number", str(issue_number),
-        "--output-dir", str(workspace_path),
-        "--token", GITLAB_TOKEN,
-        "--username", GITLAB_USERNAME,
-        "--base-domain", GIT_BASE_DOMAIN,
-        "--pr-type", "ready",
-        "--llm-model", LLM_MODEL,
-        "--llm-api-key", LLM_API_KEY,
-        "--git-user-name", GITLAB_USERNAME,
-        "--git-user-email", f"{GITLAB_USERNAME}@localhost.local",
-        *(["--llm-base-url", LLM_BASE_URL] if LLM_BASE_URL else []),
-    ]
-
-    try:
-        mr_result = subprocess.run(
-            mr_cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,  # 最大5分
-        )
-        if mr_result.returncode == 0:
-            logger.info("MR created successfully: repo=%s issue=%s", repo_path, issue_number)
-        else:
-            logger.error(
-                "MR creation failed: repo=%s issue=%s returncode=%s\nstdout=%s\nstderr=%s",
-                repo_path,
-                issue_number,
-                mr_result.returncode,
-                mr_result.stdout[-2000:],
-                mr_result.stderr[-2000:],
+        elif returncode != 0:
+            logger.error("Resolver failed: container=%s returncode=%s", container_name, returncode)
+            _post_gitlab_comment(
+                repo_path, issue_number, issue_type,
+                "❌ **OpenHands** の処理が失敗しました。`docker logs` でログを確認してください。",
             )
-    except subprocess.TimeoutExpired:
-        logger.error("MR creation timed out: repo=%s issue=%s", repo_path, issue_number)
-        subprocess.run(["docker", "rm", "-f", mr_container_name], capture_output=True)
-    except Exception:
-        logger.exception("Unexpected error creating MR: repo=%s issue=%s", repo_path, issue_number)
+            return
+
+        logger.info("Resolver finished successfully: container=%s", container_name)
+
+        # ─── MR 作成（ストリーミング） ───────────────────────────────────────
+        # resolve_issue.py はコード変更と output.jsonl の生成のみ行う。
+        # send_pull_request.py が branch push + GitLab MR 作成を担当する。
+        mr_container_name = f"openhands-mr-{issue_number}-{run_id}"
+        logger.info("Creating MR: repo=%s issue=%s", repo_path, issue_number)
+
+        mr_cmd = [
+            "docker", "run", "--rm",
+            "--name", mr_container_name,
+            # SSL 証明書（設定されている場合のみ）
+            *((["-v", f"{GITLAB_SSL_CERT}:{GITLAB_SSL_CERT}:ro",
+                "-e", f"SSL_CERT_FILE={GITLAB_SSL_CERT}",
+                "-e", f"GIT_SSL_CAINFO={GITLAB_SSL_CERT}"]
+               ) if GITLAB_SSL_CERT else []),
+            # LLM (MR タイトル・説明の生成に使用)
+            "-e", f"LLM_MODEL={LLM_MODEL}",
+            "-e", f"LLM_API_KEY={LLM_API_KEY}",
+            *((["-e", f"LLM_BASE_URL={LLM_BASE_URL}"]) if LLM_BASE_URL else []),
+            # Workspace マウント (output.jsonl の読み込みのため)
+            "-v", f"{workspace_path}:{workspace_path}",
+            # ネットワーク
+            "--network", RESOLVER_NETWORK,
+            "--add-host", "host.docker.internal:host-gateway",
+            OPENHANDS_IMAGE,
+            "python", "-m", "openhands.resolver.send_pull_request",
+            "--selected-repo", repo_path,
+            "--issue-number", str(issue_number),
+            "--output-dir", str(workspace_path),
+            "--token", GITLAB_TOKEN,
+            "--username", GITLAB_USERNAME,
+            "--base-domain", GIT_BASE_DOMAIN,
+            "--pr-type", "ready",
+            "--llm-model", LLM_MODEL,
+            "--llm-api-key", LLM_API_KEY,
+            "--git-user-name", GITLAB_USERNAME,
+            "--git-user-email", f"{GITLAB_USERNAME}@localhost.local",
+            *(["--llm-base-url", LLM_BASE_URL] if LLM_BASE_URL else []),
+        ]
+
+        mr_returncode, mr_output = _run_docker_streaming(mr_cmd, mr_container_name, 300)
+        if mr_returncode == -1:
+            logger.error("MR creation timed out: repo=%s issue=%s", repo_path, issue_number)
+            subprocess.run(["docker", "rm", "-f", mr_container_name], capture_output=True)
+            _post_gitlab_comment(
+                repo_path, issue_number, issue_type,
+                "⚠️ **OpenHands** はコードを生成しましたが、MR 作成がタイムアウトしました。",
+            )
+        elif mr_returncode != 0:
+            logger.error(
+                "MR creation failed: repo=%s issue=%s returncode=%s",
+                repo_path, issue_number, mr_returncode,
+            )
+            _post_gitlab_comment(
+                repo_path, issue_number, issue_type,
+                "⚠️ **OpenHands** はコードを生成しましたが、MR の作成に失敗しました。ログを確認してください。",
+            )
+        else:
+            # ログ出力から MR URL を抽出（例: "ready created: https://..."）
+            mr_url = next(
+                (
+                    line.split("created:", 1)[1].strip().split()[0]
+                    for line in mr_output
+                    if "created:" in line and "http" in line
+                ),
+                None,
+            )
+            msg = "✅ **OpenHands** による修正が完了しました。"
+            if mr_url:
+                msg += f"\n\nMR: {mr_url}"
+            _post_gitlab_comment(repo_path, issue_number, issue_type, msg)
+            logger.info(
+                "MR created successfully: repo=%s issue=%s url=%s",
+                repo_path, issue_number, mr_url,
+            )
+
+    finally:
+        # ─── クリーンアップ ──────────────────────────────────────────────────────
+        # 成功・失敗に関わらず Runtime コンテナとワークスペースを削除する。
+        _cleanup(workspace_path, runtime_containers_before)
 
 
 def trigger_resolver_async(repo_path: str, issue_number: int, issue_type: str) -> None:

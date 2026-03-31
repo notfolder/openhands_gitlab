@@ -132,6 +132,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /tmp/openhands-resolver-workspace:/tmp/openhands-resolver-workspace
+      - /tmp/openhands-gitlab-ssl:/tmp/openhands-gitlab-ssl:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
