@@ -60,6 +60,7 @@ AGENT_SERVER_IMAGE_TAG = os.environ.get("AGENT_SERVER_IMAGE_TAG", "1.12.0-python
 RESOLVER_WORKSPACE_HOST_PATH = os.environ.get(
     "RESOLVER_WORKSPACE_HOST_PATH", "/tmp/openhands-resolver-workspace"
 )
+OPENHANDS_LOG_DIR = os.environ.get("OPENHANDS_LOG_DIR", "/tmp/openhands-logs")
 
 
 # ─── 認証 ──────────────────────────────────────────────────────────────────────
@@ -71,6 +72,30 @@ def verify_gitlab_token(request_token: str) -> bool:
 
 
 # ─── クリーンアップヘルパー ────────────────────────────────────────────────────
+def _save_log(container_name: str, lines: list[str]) -> Path | None:
+    """コンテナのログをファイルに保存する。失敗してもエラーはログのみ。"""
+    try:
+        log_dir = Path(OPENHANDS_LOG_DIR)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"{container_name}.log"
+        log_file.write_text("\n".join(lines), encoding="utf-8")
+        logger.info("Log saved: %s", log_file)
+        return log_file
+    except Exception:
+        logger.warning("Failed to save log: container=%s", container_name, exc_info=True)
+        return None
+
+
+def _format_log_detail(lines: list[str], n: int = 200) -> str:
+    """ログの末尾 n 行を GitLab Markdown の <details> ブロックとして返す。"""
+    tail = lines[-n:] if len(lines) > n else lines
+    summary = "\n".join(tail)
+    return (
+        f"\n\n<details><summary>ログ末尾（最大{n}行）</summary>\n\n"
+        f"```\n{summary}\n```\n\n</details>"
+    )
+
+
 def _get_runtime_containers() -> set:
     """現在存在する openhands-runtime-* コンテナ名を取得する。"""
     result = subprocess.run(
@@ -353,18 +378,53 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         ]
 
         # ─── Resolver 実行（ストリーミング） ─────────────────────────────────
-        returncode, _ = _run_docker_streaming(cmd, container_name, 3600, line_callback=_progress_callback)
+        returncode, resolver_output = _run_docker_streaming(cmd, container_name, 3600, line_callback=_progress_callback)
+        _save_log(container_name, resolver_output)
         if returncode == -1:
             logger.error("Resolver timed out: container=%s", container_name)
             subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
-            _upsert_comment("⏱️ **OpenHands** の処理がタイムアウトしました（上限 1 時間）。")
+            _upsert_comment(
+                "⏱️ **OpenHands** の処理がタイムアウトしました（上限 1 時間）。"
+                + _format_log_detail(resolver_output)
+            )
             return
         elif returncode != 0:
             logger.error("Resolver failed: container=%s returncode=%s", container_name, returncode)
-            _upsert_comment("❌ **OpenHands** の処理が失敗しました。`docker logs` でログを確認してください。")
+            _upsert_comment(
+                "❌ **OpenHands** の処理が失敗しました。"
+                + _format_log_detail(resolver_output)
+            )
             return
 
         logger.info("Resolver finished successfully: container=%s", container_name)
+
+        # ─── output.jsonl で git_patch の有無を確認 ───────────────────────────
+        # OpenHands がコードを変更しなかった場合は MR 作成できないためスキップする。
+        output_jsonl_path = workspace_path / "output.jsonl"
+        git_patch: str | None = None
+        oh_success: bool = False
+        try:
+            with open(output_jsonl_path, encoding="utf-8") as _f:
+                for _line in _f:
+                    _d = json.loads(_line)
+                    if str(_d.get("issue_number")) == str(issue_number):
+                        oh_success = bool(_d.get("success", False))
+                        git_patch = _d.get("git_patch") or None
+                        break
+        except Exception:
+            logger.warning("Failed to read output.jsonl: path=%s", output_jsonl_path, exc_info=True)
+
+        if not git_patch:
+            logger.warning(
+                "No git patch found, skipping MR: issue=%s oh_success=%s",
+                issue_number, oh_success,
+            )
+            _upsert_comment(
+                "⚠️ **OpenHands** は処理を完了しましたが、コードの変更を生成できませんでした。\n\n"
+                "課題の内容を見直すか、手動での対応をご検討ください。"
+                + _format_log_detail(resolver_output)
+            )
+            return
 
         # ─── MR 作成（ストリーミング） ───────────────────────────────────────
         # resolve_issue.py はコード変更と output.jsonl の生成のみ行う。
@@ -407,16 +467,23 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
         ]
 
         mr_returncode, mr_output = _run_docker_streaming(mr_cmd, mr_container_name, 300)
+        _save_log(mr_container_name, mr_output)
         if mr_returncode == -1:
             logger.error("MR creation timed out: repo=%s issue=%s", repo_path, issue_number)
             subprocess.run(["docker", "rm", "-f", mr_container_name], capture_output=True)
-            _upsert_comment("⚠️ **OpenHands** はコードを生成しましたが、MR 作成がタイムアウトしました。")
+            _upsert_comment(
+                "⚠️ **OpenHands** はコードを生成しましたが、MR 作成がタイムアウトしました。"
+                + _format_log_detail(mr_output)
+            )
         elif mr_returncode != 0:
             logger.error(
                 "MR creation failed: repo=%s issue=%s returncode=%s",
                 repo_path, issue_number, mr_returncode,
             )
-            _upsert_comment("⚠️ **OpenHands** はコードを生成しましたが、MR の作成に失敗しました。ログを確認してください。")
+            _upsert_comment(
+                "⚠️ **OpenHands** はコードを生成しましたが、MR の作成に失敗しました。"
+                + _format_log_detail(mr_output)
+            )
         else:
             # ログ出力から MR URL を抽出（例: "ready created: https://..."）
             mr_url = next(
