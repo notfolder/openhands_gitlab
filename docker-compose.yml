@@ -127,6 +127,7 @@ services:
       - AGENT_SERVER_IMAGE_TAG=1.12.0-python
       - RESOLVER_WORKSPACE_HOST_PATH=/tmp/openhands-resolver-workspace
       - OPENHANDS_LOG_DIR=/tmp/openhands-logs
+      - MAX_ITERATIONS=${MAX_ITERATIONS:-30}
       # ローカル GitLab (HTTP) 用の自己署名証明書パス（setup.sh が自動設定）
       # 外部 GitLab (HTTPS) の場合は空のまま
       - GITLAB_SSL_CERT=${GITLAB_SSL_CERT:-}

@@ -61,6 +61,7 @@ RESOLVER_WORKSPACE_HOST_PATH = os.environ.get(
     "RESOLVER_WORKSPACE_HOST_PATH", "/tmp/openhands-resolver-workspace"
 )
 OPENHANDS_LOG_DIR = os.environ.get("OPENHANDS_LOG_DIR", "/tmp/openhands-logs")
+MAX_ITERATIONS = os.environ.get("MAX_ITERATIONS", "30")
 
 
 # ─── 認証 ──────────────────────────────────────────────────────────────────────
@@ -375,6 +376,7 @@ def run_resolver(repo_path: str, issue_number: int, issue_type: str = "issue") -
             "--llm-api-key", LLM_API_KEY,
             # LiteLLM proxy 等 OpenAI 互換 API の場合のみ設定（空なら OpenAI 直接）
             *(["--llm-base-url", LLM_BASE_URL] if LLM_BASE_URL else []),
+            "--max-iterations", MAX_ITERATIONS,
         ]
 
         # ─── Resolver 実行（ストリーミング） ─────────────────────────────────
